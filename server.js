@@ -864,7 +864,40 @@ async function pick(req, res) {
   if (process.platform !== 'win32') throw new HttpError(501, 'The picker only works on Windows. Paste a path instead.');
   if (picking) throw new HttpError(409, 'A picker is already open. It may be behind other windows.');
   const { kind } = await readJSON(req);
-  const owner = '$owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false }';
+  // Windows opens a background program's dialog behind whatever is in front (here, the browser
+  // showing the share manager), where it is easy to lose. So once the dialog exists, a timer
+  // puts it above everything and gives it the keyboard.
+  const owner = [
+    "Add-Type -Namespace DP -Name Win -MemberDefinition @'",
+    '[DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);',
+    '[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);',
+    '[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+    '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);',
+    '[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);',
+    '[DllImport("user32.dll")] public static extern bool AttachThreadInput(uint from, uint to, bool attach);',
+    '[DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();',
+    "'@",
+    '$owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false }',
+    '$script:tries = 0',
+    '$timer = New-Object System.Windows.Forms.Timer -Property @{ Interval = 100 }',
+    '$timer.Add_Tick({',
+    '  $script:tries++',
+    '  $dialog = [DP.Win]::GetWindow($owner.Handle, 6)', // the dialog this window owns
+    '  if ($dialog -ne [IntPtr]::Zero -and $dialog -ne $owner.Handle) {',
+    '    $timer.Stop()',
+    '    [void][DP.Win]::SetWindowPos($dialog, [IntPtr](-1), 0, 0, 0, 0, 0x43)', // topmost, same place and size
+    '    $front = [DP.Win]::GetForegroundWindow()',
+    '    if ($front -ne $dialog) {',
+    '      $theirs = [DP.Win]::GetWindowThreadProcessId($front, [IntPtr]::Zero)',
+    '      $mine = [DP.Win]::GetCurrentThreadId()',
+    '      [void][DP.Win]::AttachThreadInput($theirs, $mine, $true)',
+    '      [void][DP.Win]::SetForegroundWindow($dialog)',
+    '      [void][DP.Win]::AttachThreadInput($theirs, $mine, $false)',
+    '    }',
+    '  } elseif ($script:tries -gt 100) { $timer.Stop() }',
+    '})',
+    '$timer.Start()',
+  ].join('\n');
   const files = [
     '$d = New-Object System.Windows.Forms.OpenFileDialog',
     '$d.Multiselect = $true',
@@ -884,14 +917,25 @@ async function pick(req, res) {
     ...(kind === 'files' ? files : folder),
   ].join('\n');
   picking = true;
+  let abandoned = false;
   try {
     const out = await new Promise((resolve, reject) => {
-      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-Command', script],
+      // Sent encoded (base64 of UTF-16), so no quoting on the command line can mangle the script.
+      const encoded = Buffer.from(script, 'utf16le').toString('base64');
+      const child = execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-EncodedCommand', encoded],
         { timeout: 15 * 60 * 1000, windowsHide: true }, (err, stdout) => (err ? reject(err) : resolve(stdout)));
+      // If the page that asked goes away (closed or reloaded), close the dialog with it, so a
+      // forgotten one can't block the next request.
+      res.on('close', () => {
+        if (res.writableEnded) return;
+        abandoned = true;
+        child.kill();
+      });
     });
     sendJSON(res, 200, { paths: out.split('\n').map((s) => s.trim()).filter(Boolean) });
   } catch (err) {
-    console.error('Picker failed:', err.message);
+    if (abandoned) return res.destroy();
+    console.error('Picker failed:', String(err.stderr || err.message).split(/\r?\n/)[0].slice(0, 300));
     throw new HttpError(500, 'Could not open the picker. Paste a path instead.');
   } finally {
     picking = false;
