@@ -1,0 +1,10 @@
+{
+  "port": 53817,
+  "adminPort": 53818,
+  "uploadDir": "uploads",
+  "defaultUploadLimitGB": 10,
+  "defaultExpiryHours": 168,
+  "publicHost": "",
+  "certFile": "cert/cert.pem",
+  "keyFile": "cert/key.pem"
+}

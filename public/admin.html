@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DP File Share</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>DP File Share</h1>
+      <div class="status-line small">
+        <span id="address" class="muted">Looking up your public address…</span>
+        <button type="button" class="link small" id="refresh-ip">Refresh</button>
+        <span id="transfers" class="ok"></span>
+      </div>
+    </header>
+
+    <p id="offline" class="notice" hidden>Sharing is off, so this page can't reach DP File Share. Turn it on from the tray icon.</p>
+
+    <section class="card" id="new">
+      <h2>New link</h2>
+      <div class="modes">
+        <label class="mode">
+          <input type="checkbox" id="m-dl" checked>
+          <span><strong>They can download</strong><span class="muted small">Files or folders you pick from this PC</span></span>
+        </label>
+        <label class="mode">
+          <input type="checkbox" id="m-ul">
+          <span><strong>They can upload</strong><span class="muted small">They send files to you</span></span>
+        </label>
+      </div>
+
+      <div id="dl-panel" class="panel">
+        <div class="row">
+          <button type="button" class="secondary" id="add-files">Add files…</button>
+          <button type="button" class="secondary" id="add-folder">Add folder…</button>
+          <input type="text" id="add-path" placeholder="or paste a path, like E:\Photos" autocomplete="off" spellcheck="false">
+          <button type="button" class="secondary" id="add-path-btn">Add</button>
+        </div>
+        <ul id="picked" class="items"></ul>
+        <p id="picked-empty" class="muted small">Nothing added yet.</p>
+      </div>
+
+      <div id="ul-panel" class="panel" hidden>
+        <div>
+          <span class="muted">Uploads are saved to</span>
+          <span id="ul-dir" class="path">a new folder in your uploads folder</span>
+          <button type="button" class="link" id="ul-choose">Choose folder…</button>
+          <button type="button" class="link" id="ul-reset" hidden>Use default</button>
+        </div>
+        <div class="row field">
+          <label for="limit">Upload limit</label>
+          <input type="number" id="limit" min="0.01" step="any" value="10">
+          <span>GB</span>
+          <label class="check"><input type="checkbox" id="no-limit"> No limit</label>
+        </div>
+      </div>
+
+      <div class="row field">
+        <label for="expiry">Link expires after</label>
+        <select id="expiry">
+          <option value="1">1 hour</option>
+          <option value="24">1 day</option>
+          <option value="72">3 days</option>
+          <option value="168">7 days</option>
+          <option value="720">30 days</option>
+          <option value="never">Never</option>
+          <option value="custom">Pick a date…</option>
+        </select>
+        <input type="datetime-local" id="custom" hidden>
+      </div>
+
+      <div class="row field">
+        <label for="label">Name</label>
+        <input type="text" id="label" placeholder="optional, e.g. Photos for Mom" maxlength="80" autocomplete="off">
+      </div>
+
+      <div class="field row">
+        <button type="button" class="big" id="create">Create link</button>
+        <span id="create-msg" class="error"></span>
+      </div>
+
+      <div id="result" class="result" hidden>
+        <p><strong>Link ready.</strong> Copy it and send it to them.</p>
+        <div class="url"><input type="text" id="result-url" readonly><button type="button" id="copy-result">Copy</button></div>
+        <p id="result-note" class="muted small"></p>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Your links</h2>
+      <div id="links"></div>
+      <p id="no-links" class="muted">No links yet.</p>
+    </section>
+
+    <p class="muted small">
+      Only this PC can open this page. People with a link see only what's in that link, and links only
+      work while sharing is on. Your public IP can change; if it does, links you already sent stop working
+      and you'll need to send the new address.
+    </p>
+  </main>
+  <script src="/assets/admin.js"></script>
+</body>
+</html>

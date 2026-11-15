@@ -1,0 +1,14 @@
+# secrets / runtime data
+cert/
+links.json
+shares.json
+server.log
+logs/
+uploads/
+dev-uploads/
+old/
+next/
+*.mp4
+*.exe
+.claude/
+config.json

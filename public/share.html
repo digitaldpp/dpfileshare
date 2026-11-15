@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Shared files</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1 id="title">Shared files</h1>
+      <span id="expires" class="muted small"></span>
+    </header>
+
+    <p id="error" class="notice" hidden></p>
+
+    <section id="download" class="card" hidden>
+      <h2>Download</h2>
+      <nav id="crumbs" class="crumbs" aria-label="Current folder"></nav>
+      <p id="empty" class="muted" hidden>This folder is empty.</p>
+      <table id="files" hidden>
+        <thead><tr><th>Name</th><th>Size</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section id="upload" class="card" hidden>
+      <h2>Send files</h2>
+      <label id="drop" class="drop">
+        <input type="file" id="picker" multiple hidden>
+        <strong>Drop files here</strong>
+        <span class="muted">or click to choose</span>
+        <span id="room" class="muted small"></span>
+      </label>
+      <ul id="queue" class="queue"></ul>
+    </section>
+  </main>
+  <script src="/assets/share.js"></script>
+</body>
+</html>
