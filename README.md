@@ -14,7 +14,7 @@ the link to.
 
 ## Install
 
-1. Download `DP File Share.exe` from the
+1. Download `DP.File.Share.exe` from the
    [latest release](https://github.com/digitaldpp/dpfileshare/releases/latest) and put it
    anywhere you like.
 2. Run it. An icon appears in the tray (gray = off, green = on) and the share manager opens in
