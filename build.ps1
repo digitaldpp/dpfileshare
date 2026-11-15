@@ -63,7 +63,10 @@ $outFile = [System.IO.File]::Create($packed)
 $gzip = New-Object System.IO.Compression.GZipStream $outFile, ([System.IO.Compression.CompressionLevel]::Optimal)
 $in.CopyTo($gzip)
 $gzip.Dispose(); $outFile.Dispose(); $in.Dispose()
-$hash = (Get-FileHash $engine -Algorithm SHA256).Hash.ToLower()
+$sha = [System.Security.Cryptography.SHA256]::Create()
+$hashInput = [System.IO.File]::OpenRead($engine)
+$hash = -join ($sha.ComputeHash($hashInput) | ForEach-Object { $_.ToString('x2') })
+$hashInput.Dispose(); $sha.Dispose()
 [System.IO.File]::WriteAllText($idFile, "$version-$hash")
 
 # ---- 3. the tray program, with the engine attached ----
