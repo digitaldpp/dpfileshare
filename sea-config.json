@@ -1,0 +1,14 @@
+{
+  "main": "server.js",
+  "output": "build/sea-prep.blob",
+  "disableExperimentalSEAWarning": true,
+  "assets": {
+    "package.json": "package.json",
+    "admin.html": "public/admin.html",
+    "admin.js": "public/admin.js",
+    "share.html": "public/share.html",
+    "share.js": "public/share.js",
+    "gone.html": "public/gone.html",
+    "style.css": "public/style.css"
+  }
+}

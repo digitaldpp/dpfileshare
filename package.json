@@ -1,13 +1,23 @@
 {
   "name": "dp-file-share",
   "version": "1.0.0",
-  "description": "Simple password-protected HTTPS file share",
+  "description": "Share files on your PC through private, expiring links. A single Windows exe with no accounts and no cloud.",
   "main": "server.js",
   "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/digitaldpp/dpfileshare.git"
+  },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test",
+    "build": "powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "postject": "1.0.0-alpha.6"
   }
 }

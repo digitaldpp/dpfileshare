@@ -12,3 +12,6 @@ next/
 *.exe
 .claude/
 config.json
+node_modules/
+build/
+dist/

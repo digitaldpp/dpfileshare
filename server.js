@@ -15,16 +15,38 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { pipeline, Transform } = require('stream');
-const { execFileSync, execFile } = require('child_process');
+const { execFile } = require('child_process');
 
-const ROOT = __dirname;
-const PUBLIC_DIR = path.join(ROOT, 'public');
+// When built into the exe (a Node "single executable application"), the pages in public/ and
+// package.json travel inside it as assets. Run with plain `node server.js`, they come from disk.
+let sea = null;
+try {
+  sea = require('node:sea');
+  if (!sea.isSea()) sea = null;
+} catch {}
+
+const assetCache = new Map();
+function asset(name) {
+  if (!sea) return fs.readFileSync(name === 'package.json' ? path.join(__dirname, name) : path.join(__dirname, 'public', name));
+  if (!assetCache.has(name)) assetCache.set(name, Buffer.from(sea.getAsset(name)));
+  return assetCache.get(name);
+}
+
+const VERSION = JSON.parse(asset('package.json').toString('utf8')).version;
+
+// Everything the app writes (settings, links, certificate, default uploads folder) lives in
+// one data folder. The tray app picks it; on its own the server uses the folder it runs from.
+const APP_DIR = sea ? path.dirname(process.execPath) : __dirname;
+const ROOT = path.resolve(process.env.DPFS_DATA_DIR || APP_DIR);
+fs.mkdirSync(ROOT, { recursive: true });
 const LINKS_FILE = path.join(ROOT, 'links.json');
 const config = readConfig();
 
 const PORT = Number(process.env.PORT || config.port || 53817);
 const ADMIN_PORT = Number(process.env.ADMIN_PORT || config.adminPort || 53818);
-const UPLOAD_DIR = path.resolve(ROOT, config.uploadDir || 'uploads');
+const UPLOAD_DIR = config.uploadDir
+  ? path.resolve(ROOT, config.uploadDir)
+  : path.resolve(process.env.DPFS_DEFAULT_UPLOAD_DIR || path.join(ROOT, 'uploads'));
 const DEFAULT_UPLOAD_LIMIT_GB = numberOr(config.defaultUploadLimitGB, 10);
 const DEFAULT_EXPIRY_HOURS = numberOr(config.defaultExpiryHours, 168);
 const PUBLIC_HOST = String(config.publicHost || '').trim();
@@ -32,6 +54,8 @@ const CERT_FILE = path.resolve(ROOT, config.certFile || 'cert/cert.pem');
 const KEY_FILE = path.resolve(ROOT, config.keyFile || 'cert/key.pem');
 
 const GB = 1024 ** 3;
+const MAX_PENDING_UPLOADS = 100; // unfinished uploads allowed per link at once
+const MAX_FILES_PER_LINK = 10000; // files one link can receive in total
 const PART_EXT = '.dpshare-part'; // uploads in progress; never listed or downloadable
 const HIDDEN_NAMES = new Set(['$recycle.bin', 'system volume information', 'desktop.ini', 'thumbs.db']);
 const EXPIRED_KEEP_MS = 30 * 24 * 3600 * 1000; // expired links stay visible in the manager this long
@@ -62,8 +86,6 @@ class HttpError extends Error {
   }
 }
 
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-ensureCert();
 
 // ---------- links ----------
 //
@@ -86,7 +108,13 @@ function loadLinks() {
 function saveLinks() {
   const tmp = LINKS_FILE + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(links, null, 2));
-  fs.renameSync(tmp, LINKS_FILE);
+  try {
+    fs.renameSync(tmp, LINKS_FILE);
+  } catch {
+    // Antivirus or a backup tool can hold the file open for a moment, which blocks a rename.
+    fs.copyFileSync(tmp, LINKS_FILE);
+    fs.rmSync(tmp, { force: true });
+  }
 }
 
 const isActive = (link) => !link.expiresAt || link.expiresAt > Date.now();
@@ -126,7 +154,8 @@ function insideDir(dir, target) {
   return rel === '' || (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel));
 }
 
-// This app's own files are never shared, except for things in the uploads folder.
+// The app's data folder (settings, links, the certificate's private key) is never shared,
+// except for things in the uploads folder.
 const isAppPath = (real) => insideDir(ROOT, real) && !insideDir(UPLOAD_DIR, real);
 
 function displayName(real) {
@@ -214,8 +243,8 @@ function send(res, status, body = '', type = 'text/plain; charset=utf-8') {
 const sendJSON = (res, status, data) => send(res, status, JSON.stringify(data), 'application/json');
 
 const STATIC_TYPES = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8' };
-function serveStatic(res, file) {
-  send(res, 200, fs.readFileSync(path.join(PUBLIC_DIR, file)), STATIC_TYPES[path.extname(file)]);
+function serveStatic(res, file, status = 200) {
+  send(res, status, asset(file), STATIC_TYPES[path.extname(file)]);
 }
 
 function readBody(req, limit) {
@@ -283,6 +312,7 @@ function fetchText(url) {
 
 // The home connection's IP can change, so it is looked up again every few minutes.
 async function getPublicIp(force = false) {
+  if (PUBLIC_HOST) return null; // links use the configured name, so there is nothing to look up
   if (!force && ipCache.ip && Date.now() - ipCache.at < 5 * 60 * 1000) return ipCache.ip;
   for (const url of ['https://api.ipify.org', 'https://ipv4.icanhazip.com', 'https://checkip.amazonaws.com']) {
     try {
@@ -332,7 +362,7 @@ setInterval(() => {
 
 function notAvailable(res, isApi) {
   if (isApi) return sendJSON(res, 404, { error: 'This link is not available. It may have expired or been turned off.' });
-  send(res, 404, fs.readFileSync(path.join(PUBLIC_DIR, 'gone.html')), STATIC_TYPES['.html']);
+  serveStatic(res, 'gone.html', 404);
 }
 
 async function linkInfo(res, link) {
@@ -471,6 +501,13 @@ async function startUpload(req, res, link) {
     if (received !== null) return sendJSON(res, 200, { id: earlier.id, received });
   }
 
+  if (link.pending.length >= MAX_PENDING_UPLOADS) {
+    throw new HttpError(429, 'Too many unfinished uploads on this link. Let some finish, then try again.');
+  }
+  if ((link.uploadedFiles || 0) + link.pending.length >= MAX_FILES_PER_LINK) {
+    throw new HttpError(413, 'This link has received as many files as it can take.');
+  }
+
   const remaining = uploadRemaining(link);
   if (remaining !== null && size > remaining) {
     throw new HttpError(413, remaining === 0
@@ -504,6 +541,7 @@ async function finishUpload(link, p) {
   }
   link.pending = link.pending.filter((x) => x !== p);
   link.uploadedBytes = (link.uploadedBytes || 0) + p.size;
+  link.uploadedFiles = (link.uploadedFiles || 0) + 1;
   link.received = [...(link.received || []), { name, size: p.size, at: Date.now() }].slice(-200);
   saveLinks();
   log(`Received "${full}" (${formatBytes(p.size)}) on link "${link.label}"`);
@@ -528,15 +566,28 @@ async function uploadPiece(req, res, link, id, q) {
   requireUpload(link);
   const p = findPending(link, id);
   if (busyUploads.has(id)) throw new HttpError(409, 'This file is already being uploaded from another window.');
-  const received = await partSize(p);
-  if (received === null) throw new HttpError(404, 'This upload was lost. Please start it again.');
-  if (Number(q.get('offset')) !== received) return sendJSON(res, 409, { error: 'offset', received });
-
-  const room = p.size - received;
-  const length = Number(req.headers['content-length']);
-  if (!Number.isSafeInteger(length) || length < 1 || length > room) throw new HttpError(400, 'Bad piece size');
-
+  // Claimed before the first await, so two pieces arriving together can't both write.
   busyUploads.add(id);
+  let received;
+  let room;
+  try {
+    received = await partSize(p);
+    if (received === null) throw new HttpError(404, 'This upload was lost. Please start it again.');
+    room = p.size - received;
+    const length = Number(req.headers['content-length']);
+    if (Number(q.get('offset')) === received && (!Number.isSafeInteger(length) || length < 1 || length > room)) {
+      throw new HttpError(400, 'Bad piece size');
+    }
+  } catch (err) {
+    busyUploads.delete(id);
+    throw err;
+  }
+  if (Number(q.get('offset')) !== received) {
+    busyUploads.delete(id);
+    res.setHeader('Connection', 'close'); // the piece's body is not read
+    return sendJSON(res, 409, { error: 'offset', received });
+  }
+
   active.uploads++;
   let bytes = 0;
   const limiter = new Transform({
@@ -550,6 +601,15 @@ async function uploadPiece(req, res, link, id, q) {
   pipeline(req, limiter, fs.createWriteStream(p.partPath, { flags: 'a' }), async (err) => {
     busyUploads.delete(id);
     active.uploads--;
+    if (!links.includes(link) || !link.pending.includes(p)) {
+      // The link was deleted while this piece was arriving: don't leave the partial file behind.
+      await fsp.unlink(p.partPath).catch(() => {});
+      if (!res.headersSent) {
+        res.setHeader('Connection', 'close');
+        sendJSON(res, 404, { error: 'This link is not available. It may have expired or been turned off.' });
+      }
+      return;
+    }
     if (err) {
       if (!res.headersSent) {
         res.setHeader('Connection', 'close');
@@ -590,11 +650,14 @@ async function handlePublic(req, res) {
   if (m === 'GET' && p === '/robots.txt') return send(res, 200, 'User-agent: *\nDisallow: /\n');
   if (m === 'GET' && p === '/assets/style.css') return serveStatic(res, 'style.css');
   if (m === 'GET' && p === '/assets/share.js') return serveStatic(res, 'share.js');
+  if (m === 'GET' && p === '/favicon.ico') return send(res, 204);
 
+  if (isBlocked(ip)) return send(res, 429, 'Too many requests. Try again later.');
+  // Only wrong links count as guesses. Browsers and scanners ask for plenty of other paths.
+  if (!p.startsWith('/s/')) return send(res, 404, 'Not found');
   const match = /^\/s\/([A-Za-z0-9_-]{20,64})(\/.*)?$/.exec(p);
   const sub = (match && match[2]) || '';
   const isApi = sub.length > 1;
-  if (isBlocked(ip)) return send(res, 429, 'Too many requests. Try again later.');
   const link = match && findByToken(match[1]);
   if (!link || !isActive(link)) {
     recordMiss(ip);
@@ -639,6 +702,8 @@ function adminView(link) {
 async function status(res) {
   await getPublicIp();
   sendJSON(res, 200, {
+    version: VERSION,
+    dataDir: ROOT,
     publicIp: ipCache.ip,
     publicHost: PUBLIC_HOST || null,
     port: PORT,
@@ -878,26 +943,100 @@ function lanAddresses() {
     .map((i) => i.address);
 }
 
-function ensureCert() {
-  if (fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE)) return;
-  log('No certificate found, generating a self-signed one...');
-  fs.mkdirSync(path.dirname(CERT_FILE), { recursive: true });
+const CERT_NAME = 'DP File Share';
+const CERT_DAYS = 825;
 
-  const san = ['DNS:localhost', `DNS:${os.hostname()}`, ...lanAddresses().map((ip) => `IP:${ip}`)].join(',');
-  const args = [
-    'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-sha256', '-days', '825',
-    '-keyout', KEY_FILE, '-out', CERT_FILE,
-    '-subj', '/CN=DP File Share', '-addext', `subjectAltName=${san}`,
-  ];
-  for (const exe of ['openssl', 'C:\\Program Files\\Git\\usr\\bin\\openssl.exe', 'C:\\Program Files\\Git\\mingw64\\bin\\openssl.exe']) {
-    try {
-      execFileSync(exe, args, { stdio: 'ignore', windowsHide: true });
-      return;
-    } catch {}
+// Just enough DER (the binary format certificates are written in) to build one ourselves, so
+// nothing like OpenSSL has to be installed.
+function der(tag, ...parts) {
+  const body = Buffer.concat(parts);
+  const len = [];
+  if (body.length < 128) len.push(body.length);
+  else {
+    for (let n = body.length; n > 0; n = Math.floor(n / 256)) len.unshift(n % 256);
+    len.unshift(0x80 | len.length);
   }
-  console.error('Could not run openssl to create a certificate. Install OpenSSL (it comes with Git for Windows)');
-  console.error(`or place your own certificate at ${CERT_FILE} and key at ${KEY_FILE}.`);
-  process.exit(1);
+  return Buffer.concat([Buffer.from([tag]), Buffer.from(len), body]);
+}
+const derSeq = (...parts) => der(0x30, ...parts);
+const derUtf8 = (s) => der(0x0c, Buffer.from(s, 'utf8'));
+const derTime = (d) => der(0x17, Buffer.from(d.toISOString().replace(/[-:T]/g, '').slice(2, 14) + 'Z', 'ascii'));
+function derOid(oid) {
+  const n = oid.split('.').map(Number);
+  const out = [n[0] * 40 + n[1]];
+  for (const v of n.slice(2)) {
+    const bytes = [v & 0x7f];
+    for (let rest = v >>> 7; rest > 0; rest >>>= 7) bytes.unshift((rest & 0x7f) | 0x80);
+    out.push(...bytes);
+  }
+  return der(0x06, Buffer.from(out));
+}
+function derInt(buf) {
+  let b = buf;
+  while (b.length > 1 && b[0] === 0 && !(b[1] & 0x80)) b = b.subarray(1);
+  if (b[0] & 0x80) b = Buffer.concat([Buffer.from([0]), b]);
+  return der(0x02, b);
+}
+
+// A self-signed certificate for this PC: localhost, the computer name and its network addresses.
+function makeSelfSignedCert() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const algorithm = derSeq(derOid('1.2.840.10045.4.3.2')); // ECDSA with SHA-256
+  const name = derSeq(der(0x31, derSeq(derOid('2.5.4.3'), derUtf8(CERT_NAME))));
+  const from = new Date(Date.now() - 24 * 3600 * 1000);
+  const to = new Date(Date.now() + CERT_DAYS * 24 * 3600 * 1000);
+  const serial = crypto.randomBytes(16);
+  serial[0] = (serial[0] & 0x7f) | 0x40;
+
+  const dnsNames = ['localhost', os.hostname(), PUBLIC_HOST].filter((h) => /^[A-Za-z0-9.-]+$/.test(h) && !net.isIP(h));
+  const altNames = [
+    ...[...new Set(dnsNames)].map((h) => der(0x82, Buffer.from(h, 'ascii'))),
+    ...[...new Set(['127.0.0.1', ...lanAddresses()])].map((ip) => der(0x87, Buffer.from(ip.split('.').map(Number)))),
+  ];
+  const extensions = derSeq(
+    derSeq(derOid('2.5.29.17'), der(0x04, derSeq(...altNames))), // names it is valid for
+    derSeq(derOid('2.5.29.37'), der(0x04, derSeq(derOid('1.3.6.1.5.5.7.3.1')))), // for web servers
+    derSeq(derOid('2.5.29.19'), der(0x01, Buffer.from([0xff])), der(0x04, derSeq())), // can't sign other certificates
+  );
+  const body = derSeq(
+    der(0xa0, derInt(Buffer.from([2]))), // X.509 version 3
+    derInt(serial),
+    algorithm,
+    name, // issued by itself
+    derSeq(derTime(from), derTime(to)),
+    name,
+    publicKey.export({ type: 'spki', format: 'der' }),
+    der(0xa3, extensions),
+  );
+  const signature = crypto.sign('sha256', body, privateKey);
+  const cert = derSeq(body, algorithm, der(0x03, Buffer.from([0]), signature));
+  const lines = cert.toString('base64').match(/.{1,64}/g).join('\n');
+  return {
+    cert: `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----\n`,
+    key: privateKey.export({ type: 'pkcs8', format: 'pem' }),
+  };
+}
+
+// True for a certificate this app made that has run out (or is about to). A certificate you
+// supplied yourself is never replaced.
+function ownCertExpired() {
+  try {
+    const x = new crypto.X509Certificate(fs.readFileSync(CERT_FILE));
+    return x.subject === `CN=${CERT_NAME}` && x.issuer === x.subject && Date.parse(x.validTo) < Date.now() + 7 * 24 * 3600 * 1000;
+  } catch {
+    return false;
+  }
+}
+
+function ensureCert() {
+  const have = fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE);
+  if (have && !ownCertExpired()) return;
+  log(have ? 'The self-signed certificate has expired, making a new one...' : 'No certificate found, making a self-signed one...');
+  const made = makeSelfSignedCert();
+  fs.mkdirSync(path.dirname(CERT_FILE), { recursive: true });
+  fs.mkdirSync(path.dirname(KEY_FILE), { recursive: true });
+  fs.writeFileSync(KEY_FILE, made.key, { mode: 0o600 });
+  fs.writeFileSync(CERT_FILE, made.cert);
 }
 
 // ---------- start ----------
@@ -915,7 +1054,34 @@ function wrap(handler) {
   };
 }
 
-const publicServer = https.createServer({ cert: fs.readFileSync(CERT_FILE), key: fs.readFileSync(KEY_FILE) }, wrap(handlePublic));
+// A stray failed promise is logged instead of taking the whole server (and every transfer) down.
+process.on('unhandledRejection', (err) => console.error('Unexpected error:', err));
+
+// Started by the tray app: if the tray goes away without turning sharing off (it crashed or was
+// ended from Task Manager), stop too, so nothing keeps sharing with no icon to show it.
+const PARENT_PID = Number(process.env.DPFS_PARENT_PID) || 0;
+if (PARENT_PID) {
+  setInterval(() => {
+    try {
+      process.kill(PARENT_PID, 0);
+    } catch {
+      log('The tray app is no longer running, turning off.');
+      process.exit(0);
+    }
+  }, 3000).unref();
+}
+
+let tlsOptions;
+try {
+  ensureCert();
+  tlsOptions = { cert: fs.readFileSync(CERT_FILE), key: fs.readFileSync(KEY_FILE) };
+  https.createServer(tlsOptions).close(); // fails here, with a clear message, if the files are not usable
+} catch (err) {
+  console.error(`The certificate (${CERT_FILE}) or its key (${KEY_FILE}) could not be used: ${err.message}`);
+  console.error('Delete both files to have a new self-signed certificate made, or fix certFile / keyFile in config.json.');
+  process.exit(1);
+}
+const publicServer = https.createServer(tlsOptions, wrap(handlePublic));
 publicServer.requestTimeout = 0; // big transfers can take a long time
 const adminServer = http.createServer(wrap(handleAdmin));
 
@@ -935,6 +1101,7 @@ publicServer.listen(PORT, () => {
     log(`DP File Share is on. Private links are served on port ${PORT}.`);
     log(`Share manager (this PC only): http://127.0.0.1:${ADMIN_PORT}`);
     await sweep().catch((err) => console.error('Cleanup failed:', err.message));
+    if (PUBLIC_HOST) return log(`Links use the address ${PUBLIC_HOST} (publicHost in config.json).`);
     const ip = await getPublicIp();
     log(ip ? `Public IP: ${ip}` : 'Could not look up the public IP (no internet?). Links will show a placeholder until it works.');
   });
