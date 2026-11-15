@@ -37,16 +37,33 @@ const VERSION = JSON.parse(asset('package.json').toString('utf8')).version;
 // Everything the app writes (settings, links, certificate, default uploads folder) lives in
 // one data folder. The tray app picks it; on its own the server uses the folder it runs from.
 const APP_DIR = sea ? path.dirname(process.execPath) : __dirname;
-const ROOT = path.resolve(process.env.DPFS_DATA_DIR || APP_DIR);
-fs.mkdirSync(ROOT, { recursive: true });
+// Paths are compared to keep the app's own data from being shared, so they are stored the way
+// Windows itself spells them: no short names (PROGRA~1), junctions or shortcuts in between.
+function truePath(p) {
+  const missing = [];
+  let at = path.resolve(p);
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync.native(at), ...missing);
+    } catch {
+      const parent = path.dirname(at);
+      if (parent === at) return path.resolve(p);
+      missing.unshift(path.basename(at));
+      at = parent;
+    }
+  }
+}
+
+fs.mkdirSync(path.resolve(process.env.DPFS_DATA_DIR || APP_DIR), { recursive: true });
+const ROOT = truePath(process.env.DPFS_DATA_DIR || APP_DIR);
 const LINKS_FILE = path.join(ROOT, 'links.json');
 const config = readConfig();
 
 const PORT = Number(process.env.PORT || config.port || 53817);
 const ADMIN_PORT = Number(process.env.ADMIN_PORT || config.adminPort || 53818);
-const UPLOAD_DIR = config.uploadDir
+const UPLOAD_DIR = truePath(config.uploadDir
   ? path.resolve(ROOT, config.uploadDir)
-  : path.resolve(process.env.DPFS_DEFAULT_UPLOAD_DIR || path.join(ROOT, 'uploads'));
+  : process.env.DPFS_DEFAULT_UPLOAD_DIR || path.join(ROOT, 'uploads'));
 const DEFAULT_UPLOAD_LIMIT_GB = numberOr(config.defaultUploadLimitGB, 10);
 const DEFAULT_EXPIRY_HOURS = numberOr(config.defaultExpiryHours, 168);
 const PUBLIC_HOST = String(config.publicHost || '').trim();

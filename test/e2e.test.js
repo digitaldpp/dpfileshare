@@ -19,6 +19,8 @@ const PORT = 53900 + Math.floor(Math.random() * 50) * 2;
 const ADMIN_PORT = PORT + 1;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dpfs-test-'));
 const dataDir = path.join(tmp, 'data');
+const dataLink = path.join(tmp, 'data-link'); // a junction to dataDir; the server is started through it
+const realDataDir = () => fs.realpathSync.native(dataDir);
 const shared = path.join(tmp, 'shared');
 const outside = path.join(tmp, 'outside.txt');
 const bigFile = crypto.randomBytes(300 * 1024);
@@ -29,7 +31,7 @@ let output = '';
 function startServer() {
   const engine = process.env.DPFS_ENGINE;
   server = spawn(engine || process.execPath, engine ? [] : [path.join(__dirname, '..', 'server.js')], {
-    env: { ...process.env, DPFS_DATA_DIR: dataDir, PORT: '', ADMIN_PORT: '' },
+    env: { ...process.env, DPFS_DATA_DIR: dataLink, PORT: '', ADMIN_PORT: '' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stdout.on('data', (d) => (output += d));
@@ -82,6 +84,7 @@ async function waitFor(check, what) {
 test.before(async () => {
   fs.mkdirSync(path.join(shared, 'sub folder'), { recursive: true });
   fs.mkdirSync(dataDir, { recursive: true });
+  fs.symlinkSync(dataDir, dataLink, 'junction');
   fs.writeFileSync(path.join(shared, 'hello.txt'), 'hello world');
   fs.writeFileSync(path.join(shared, 'sub folder', 'big ünïcode.bin'), bigFile);
   fs.writeFileSync(path.join(shared, 'half-done.dpshare-part'), 'partial');
@@ -115,7 +118,7 @@ test('share manager only answers its own page on this PC', async () => {
   assert.equal((await request(adminUrl('/'), { headers: { Host: 'evil.example' } })).status, 403, 'DNS rebinding');
   const status = (await admin('/api/status')).json;
   assert.equal(status.version, require('../package.json').version);
-  assert.equal(status.dataDir, dataDir);
+  assert.equal(status.dataDir, realDataDir());
   // The manager must not be reachable through the public port.
   assert.equal((await pub('/api/status', { headers: { 'X-Requested-With': 'fetch' } })).status, 404);
 });
@@ -136,6 +139,7 @@ test('rejects bad link requests', async () => {
   assert.equal(await bad({ download: true, items: ['relative\\path'] }), 400);
   assert.equal(await bad({ download: true, items: [path.join(tmp, 'missing')] }), 400);
   assert.equal(await bad({ download: true, items: [path.join(dataDir, 'cert')] }), 400, "the app's own data");
+  assert.equal(await bad({ download: true, items: [path.join(dataLink, 'cert')] }), 400, "the app's own data, through a junction");
   assert.equal(await bad({ download: true, items: [shared], expiresAt: Date.now() - 1000 }), 400, 'expiry in the past');
   assert.equal(await bad({ upload: true, uploadLimitGB: 0 }), 400);
 });
@@ -219,7 +223,7 @@ test('upload link: pieces, resume, limits, safe names', async () => {
   const link = await createLink({ upload: true, label: 'Send me stuff', uploadLimitGB: 0.001 }); // about 1 MB
   assert.equal((await pub(`${link.base}/list?item=0`)).status, 403, 'upload-only link');
   const dir = link.uploadDir;
-  assert.ok(dir.startsWith(path.join(dataDir, 'uploads')));
+  assert.ok(dir.startsWith(path.join(realDataDir(), 'uploads')));
 
   const done = await upload(link, 'report.bin', bigFile);
   assert.deepEqual([done.json.done, done.json.name], [true, 'report.bin']);
